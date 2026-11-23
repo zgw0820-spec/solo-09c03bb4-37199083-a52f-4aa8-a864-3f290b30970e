@@ -27,6 +27,14 @@
 **去重与环路**：删除集按 `(schema, 表) -> 主键值集合` 维护，固定点遍历，
 同一行无论被环路还是多条级联路径命中只列一次。
 
+**主键写法归一**：传入的主键文本先在库内按列类型归一
+（`raw::列类型::text`，如 `'007' / '+7' / ' 7 '` 对 bigint 都归一为 `'7'`），
+存在性按 PostgreSQL 的键比较规则判定；删除集与阻断明细全程使用规范形态，
+同一行即使由不同写法指定也只列一次。`targets` 仍逐项回显传入的原始写法。
+阻断回执按留存的引用行汇总，`references.via` 通过库内 JOIN 认定该行
+实际引用的待删主键（外键列与主键列类型不同也按库内匹配关系认定），
+命中关系逐对记录，内存占用随实际命中数线性增长。
+
 ## 2. 快照与并发
 
 每次预检在一个 `REPEATABLE READ ... READ ONLY` 事务内完成全部查询，
@@ -39,7 +47,7 @@
 app/
   config.py     环境变量配置（DATABASE_URL / DEFAULT_SCHEMAS / 超时）
   catalog.py    pg_catalog 读取表、主键、外键元数据
-  queries.py    按外键查命中行的只读 SQL（主键值按列实际类型转换）
+  queries.py    只读 SQL：主键写法归一、存在性、按外键查命中行 / 命中对
   precheck.py   核心：边分类、删除集固定点遍历、阻断判定、超范围取证
   models.py     Pydantic 请求 / 响应模型
   main.py       FastAPI 入口、只读事务、连接池、异常处理
@@ -47,7 +55,7 @@ db/
   01_schema.sql 样例库结构（16 张表，覆盖全部场景）
   02_seed.sql   种子数据
 scripts/
-  http_regression.py       HTTP 端到端回归（26 项断言）
+  http_regression.py       HTTP 端到端回归（39 项断言）
   delete_compare.py        预检预测 vs 真实 DELETE 对比（克隆库）
   snapshot_test.py         快照隔离单库实测
   http_concurrency_test.py HTTP 层并发写入实测
@@ -110,7 +118,36 @@ DATABASE_URL=postgresql://user:pass@host:5432/device_ops \
 错误约定：入参类问题（表不存在、复合主键、主键值无法转列类型）返回 4xx，
 数据库侧其他错误返回 502，均带结构化 `detail`。
 
-## 6. 实测结果
+## 6. 修复记录（主键写法归一 + 阻断 via 精确化）
+
+本次修复的两个缺陷：
+
+1. **带前导零等设备号被误报不存在**：存在性判定曾用「传入文本」与
+   「库内 `::text` 输出」做字符串比较，`pk=02` 虽能在 SQL 里按 bigint 匹配到
+   设备 2，回执却报 `exists=false` 并整体跳过。现改为先把传入写法在库内
+   归一（`raw::列类型::text`），再以规范形态判定存在性、构建删除集；
+   `targets` 仍逐项回显传入的原始写法。
+2. **留存复核单被列为阻断了与它无关的复测**：NO ACTION 命中曾按
+   「批」归因 —— 一批目标值展开时，每个命中的引用行都被记上整批目标值。
+   批量预检设备 2+3 时，留存复核单 602（只引用 retest 1003）的
+   `references.via` 会错误包含 1002。现改为 `referencing_pk_pairs`
+   逐对返回「引用行主键 → 该行实际引用的目标主键」（库内 JOIN 认定，
+   外键与主键类型不同也按库内匹配关系取主键规范形态），内存占用随实际
+   命中关系数线性增长，不再按批放大。
+
+修复过程中顺带修正：CASCADE 分支改用 `deletion.get(...)`，避免无命中时
+向 defaultdict 写入空集合导致 `planned_deletes` 出现空表条目（回归测试
+当场抓获，已补断言）。
+
+修复前后对比（同库同请求）：
+
+| 请求 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `GET pk=02` | `exists=false`，整行跳过 | `exists=true`，拟删清单规范形态 `["2"]`，结论与 `pk=2` 一致 |
+| POST `["2","02","+2"]` | 同一行可能重复计入 | 逐项回显 3 条原始写法均存在，拟删清单仅 `["2"]` 一行 |
+| POST 设备 2+3 | 602 的 via 含 `1002,1003` | 602 的 via 仅 `["public.retest.id=1003"]`，同删的 601 在拟删清单 |
+
+## 7. 实测结果
 
 实测环境：本机免 root PostgreSQL 15.20（Debian bookworm 包解包运行，端口 5433）、
 Python 3.11 + FastAPI 0.165 + psycopg 3.3.9。Docker 守护进程与 Docker Hub
@@ -127,8 +164,12 @@ Python 3.11 + FastAPI 0.165 + psycopg 3.3.9。Docker 守护进程与 Docker Hub
 | node_a/node_b 互指环路 | 两表各 1 行，可删 | ✅ 与预期一致 |
 | 批量请求 | 重复目标去重、不存在主键跳过并提示 | ✅ 与预期一致 |
 | 入参校验 | 复合主键表 / 不存在表 400；非法主键值 400（sqlstate 22P02） | ✅ 与预期一致 |
+| 主键写法归一 | `02` / `+2` / ` 4 ` 按 PG 键比较规则判定存在；`2.0` 按 PG 转换规则 400 | ✅ 与预期一致 |
+| 多写法同一行 | `["2","02","+2"]` 逐项回显、拟删清单只列 `["2"]` 一次 | ✅ 与预期一致 |
+| 批量 2+3 via 精确性 | 仅 602 阻断且 via 只含 `retest.id=1003`；601 在拟删清单 | ✅ 与预期一致 |
+| 跨类型外键 | int4 外键 → bigint 主键 + 目标 `007`：存在、via 取主键规范形态 `7` | ✅ 与预期一致 |
 
-- **HTTP 回归**：`scripts/http_regression.py` —— **26/26 通过**。
+- **HTTP 回归**：`scripts/http_regression.py` —— **39/39 通过**。
 - **真实 DELETE 对比**（克隆库 `device_ops_verify`，`SET CONSTRAINTS ALL DEFERRED`
   后真实执行）：5 个关键场景预测与 PostgreSQL 实际行为**全部一致**——
   预测阻断的删除均在预期约束上报错回滚；预测可删的删除成功提交，
@@ -137,7 +178,7 @@ Python 3.11 + FastAPI 0.165 + psycopg 3.3.9。Docker 守护进程与 Docker Hub
   新事务可见新行；HTTP 层 20 并发预检 + 同时写入，回执全程稳定。
 - **只读核对**：全部测试后源库 16 张表行数与种子数据逐一比对，零变化。
 
-## 7. 剩余事项与已知限制
+## 8. 剩余事项与已知限制
 
 1. **容器链路未在本环境实跑**：无 Docker 守护进程且 Docker Hub 不可达；
    `Dockerfile` / `docker-compose.yml` 已按标准写法交付并通过 YAML 校验，

@@ -18,7 +18,14 @@ from .models import (
     TargetResult,
     UnsupportedItem,
 )
-from .queries import matching_rows, qident, referencing_pk_values, rows_exist
+from .queries import (
+    canonicalize_values,
+    matching_rows,
+    qident,
+    referencing_pk_pairs,
+    referencing_pk_values,
+    rows_exist,
+)
 
 SUPPORTED_ACTIONS = {"CASCADE", "NO ACTION"}
 SAMPLE_LIMIT = 200
@@ -114,6 +121,9 @@ def run_precheck(conn: psycopg.Connection, tables: dict, pks: dict, fks: list[Fk
     notices: list[str] = []
 
     # ---- 1. 目标行存在性 ----------------------------------------------
+    # 主键写法先在库内按列类型归一（'007' -> '7'）：存在性按 PostgreSQL 的
+    # 键比较规则判定，删除集只存规范形态 —— 同一行无论以哪种写法传入，
+    # 拟删清单都只列一次；targets 仍逐项回显传入的原始写法。
     target_results: list[TargetResult] = []
     existing: dict[tuple[str, str], set[str]] = defaultdict(set)
     grouped: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -121,24 +131,28 @@ def run_precheck(conn: psycopg.Connection, tables: dict, pks: dict, fks: list[Fk
         grouped[(schema, table)].append(value)
     for (schema, table), values in grouped.items():
         pk_col = pks[(schema, table)][0]
-        found = rows_exist(conn, schema, table, pk_col, values)
+        canon = canonicalize_values(conn, schema, table, pk_col, values)
+        found = rows_exist(conn, schema, table, pk_col,
+                           sorted(set(canon.values())))
         for v in values:
+            cv = canon[v]
             target_results.append(TargetResult(
                 schema=schema, table=table, pk_column=pk_col,
-                pk_value=v, exists=v in found,
+                pk_value=v, exists=cv in found,
             ))
-            if v in found:
-                existing[(schema, table)].add(v)
-        missing = sorted(set(values) - found)
+            if cv in found:
+                existing[(schema, table)].add(cv)
+        missing = sorted({v for v in values if canon[v] not in found})
         if missing:
             notices.append(
                 f"{schema}.{table} 中不存在的主键值已跳过: {', '.join(missing)}"
             )
 
     # ---- 2. 固定点遍历求删除集（仅受支持的 CASCADE 边）----------------
-    # deletion: 表 -> 拟删主键值集合；环路 / 多路径靠集合天然去重
+    # deletion: 表 -> 拟删主键值集合（规范形态）；环路 / 多路径靠集合天然去重
     deletion: dict[tuple[str, str], set[str]] = defaultdict(set)
-    # no_action_hits: 边 -> (引用表pk值 -> 命中的目标主键值集合)
+    # no_action_hits: 边 -> (引用行主键 -> 该行实际引用的目标主键集合)
+    # 逐对记录命中关系，内存随实际命中数线性增长，不会按批放大
     no_action_hits: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     worklist: list[tuple[str, str, list[str]]] = [
         (k[0], k[1], sorted(v)) for k, v in existing.items()
@@ -154,23 +168,26 @@ def run_precheck(conn: psycopg.Connection, tables: dict, pks: dict, fks: list[Fk
             fk = edge.fk
             from_key = (fk.from_schema, fk.from_table)
             from_pk_col = pks[from_key][0]
-            hits = referencing_pk_values(conn, fk, values, from_pk_col)
-            if not hits:
-                continue
             if fk.on_delete == "CASCADE":
-                new = hits - deletion[from_key]
+                hits = referencing_pk_values(conn, fk, values, from_pk_col)
+                # .get 而非下标：无命中时不向 defaultdict 写入空集合，
+                # 避免 planned_deletes 出现空表条目
+                new = hits - deletion.get(from_key, set())
                 if new:
                     deletion[from_key].update(new)
                     worklist.append((fk.from_schema, fk.from_table, sorted(new)))
-            else:  # NO ACTION
-                store = no_action_hits[
-                    fk.constraint + "|" + fk.from_schema + "|" + fk.from_table
-                ]
-                for h in hits:
-                    store[h].update(values)
+            else:  # NO ACTION：逐对记录“哪一行引用了哪个待删主键”
+                pairs = referencing_pk_pairs(conn, fk, values, from_pk_col)
+                if pairs:
+                    store = no_action_hits[
+                        fk.constraint + "|" + fk.from_schema + "|" + fk.from_table
+                    ]
+                    for from_pk, to_pk in pairs:
+                        store[from_pk].add(to_pk)
 
     # ---- 3. NO ACTION 阻断判定：引用行也会删 -> 不阻断 -----------------
-    # 同一引用行可能被多条边 / 环路多次命中，按行去重后聚合
+    # 按留存的引用行汇总；references.via 只列该行实际引用的待删主键
+    # （库内 JOIN 认定的规范形态，与 planned_deletes 的写法一致）
     blocker_agg: dict[tuple[str, str, str], dict] = {}
     for edge_key, rows in no_action_hits.items():
         edge = edge_index[edge_key]

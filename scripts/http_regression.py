@@ -1,4 +1,5 @@
-"""HTTP 端到端回归：覆盖阻断 / 干净级联 / 事务末检查 / 环路 / 去重 / 校验 / 超范围。
+"""HTTP 端到端回归：覆盖阻断 / 干净级联 / 事务末检查 / 环路 / 去重 / 校验 / 超范围，
+以及主键写法归一（前导零等）与批量预检阻断 via 精确性。
 
 前置：服务已在 127.0.0.1:8000 运行，样例库已加载 db/ 下脚本。
 运行：python -I scripts/http_regression.py
@@ -131,6 +132,50 @@ try:
         check("Swagger UI 200", resp.status == 200)
 except urllib.error.HTTPError as exc:
     check("Swagger UI 200", False, str(exc.code))
+
+# 13. 前导零写法：存在性按 PostgreSQL 键比较规则判定，拟删清单用规范形态
+s, r = get("/api/v1/precheck?table=equipment&pk=02")
+check("前导零 HTTP200", s == 200)
+check("前导零 exists=true", r["targets"][0]["exists"] is True
+      and r["targets"][0]["pk_value"] == "02")
+eq = next(p for p in r["planned_deletes"] if p["table"] == "equipment")
+check("前导零 拟删规范形态且仅1行",
+      eq["pk_values"] == ["2"] and eq["row_count"] == 1)
+check("前导零 与 pk=2 结论一致",
+      names(r["planned_deletes"]) == [
+          "equipment", "inspection", "inspection_attachment", "retest", "retest_review"]
+      and r["summary"]["blocking_references"] == 0)
+
+# 14. 同一行多种写法批量传入：逐项回显原始写法，拟删清单只列一次
+s, r = post({"targets": [
+    {"table": "equipment", "pk": "2"},
+    {"table": "equipment", "pk": "02"},
+    {"table": "equipment", "pk": "+2"}]})
+check("多写法 HTTP200", s == 200)
+check("多写法 逐项回显原始写法",
+      [t["pk_value"] for t in r["targets"]] == ["2", "02", "+2"]
+      and all(t["exists"] for t in r["targets"]))
+eq = next(p for p in r["planned_deletes"] if p["table"] == "equipment")
+check("多写法 同一行只列一次", eq["pk_values"] == ["2"] and eq["row_count"] == 1)
+
+# 15. 批量 2+3：留存复核单 602 的 via 只含它实际引用的 retest 1003
+s, r = post({"targets": [
+    {"table": "equipment", "pk": "2"}, {"table": "equipment", "pk": "3"}]})
+check("批量2+3 HTTP200", s == 200)
+check("批量2+3 仅 retest_review 阻断",
+      names(r["blocking_references"]) == ["retest_review"])
+blk = r["blocking_references"][0]
+check("批量2+3 阻断行为 602", blk["pk_value"] == "602")
+check("批量2+3 via 精确指向 1003",
+      blk["references"]["via"] == ["public.retest.id=1003"])
+rr = next(p for p in r["planned_deletes"] if p["table"] == "retest_review")
+check("批量2+3 同删的 601 在拟删清单", rr["pk_values"] == ["601"])
+
+# 16. 前导零的不存在行：仍按库内比较判定为不存在并提示
+s, r = get("/api/v1/precheck?table=equipment&pk=08888")
+check("前导零不存在行 exists=false", r["targets"][0]["exists"] is False
+      and r["summary"]["rows_to_delete"] == 0
+      and any("08888" in n for n in r["notices"]))
 
 passed = sum(1 for _, ok, _ in checks if ok)
 for name, ok, detail in checks:
